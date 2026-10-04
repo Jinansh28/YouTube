@@ -1,20 +1,26 @@
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
 import { User } from "../models/user.model.js";
-import { uploadOnCloudinary } from "../utils/cloudinary.js";
+import { deleteFromCloudinary, uploadOnCloudinary } from "../utils/cloudinary.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import jwt from "jsonwebtoken"
+import { v2 as cloudinary} from "cloudinary";
+import { extractPublicId } from 'cloudinary-build-url'
 
 
 const generateAccessAndRefreshToken = async(userId) => {
     try {
         const user = await User.findById(userId)
+
+        if(!user){
+            throw new ApiError(404, "User not found");
+        }
+
         const accessToken = await user.generateAccessToken()
         const refreshToken = await user.generateRefreshToken()
 
         user.refreshToken = refreshToken 
-        await user.save({validateBeforeSave : false})
-
+        await user.save({validateBeforeSave : false})    
         return {accessToken ,refreshToken}
 
     } catch (error) {
@@ -64,34 +70,52 @@ const registerUser = asyncHandler( async (req, res) => {
         throw new ApiError(400, "Avatar file is required")
     }
 
-    const avatar = await uploadOnCloudinary(avatarLocalPath)
-    const coverImage = await uploadOnCloudinary(coverImageLocalPath)
+    let avatar, coverImage;
+    try {
+        avatar = await uploadOnCloudinary(avatarLocalPath)
+        coverImage = await uploadOnCloudinary(coverImageLocalPath)
+    } catch (error) {
+        throw new ApiError(500, "Failed to upload image to cloudinary")
+    }
     
     if(!avatar){
         throw new ApiError(400, "Avatar is required")
     }
 
 
-    const user = await User.create({
-        fullname,
-        avatar : avatar.url,
-        coverImage : coverImage?.url || "",
-        email,
-        password,
-        username : username.toLowerCase()
-    })
+    try {
+        const user = await User.create({
+            fullname,
+            avatar : avatar.url,
+            coverImage : coverImage?.url || "",
+            email,
+            password,
+            username : username.toLowerCase()
+        })
+    
+        const createdUser = await User.findById(user._id).select(
+            "-password -refreshToken"
+        )
+    
+        if(!createdUser){
+            throw new ApiError(500, "Something went wrong while registering the user")
+        }
+    
+        return res.status(201).json(
+            new ApiResponse(200, createdUser, "User registered successfully")
+        )
+    } catch (error) {
+        console.log("User creation failed")
 
-    const createdUser = await User.findById(user._id).select(
-        "-password -refreshToken"
-    )
-
-    if(!createdUser){
-        throw new ApiError(500,"Something went wrong while registering the user")
+        if(avatar){
+            await deleteFromCloudinary(avatar.public_id)
+        }
+        if(coverImage){
+            await deleteFromCloudinary(coverImage.public_id)
+        }
+        
+        throw new ApiError(500, "Something went wrong while registering the user & images were deleted")
     }
-
-    return res.status(201).json(
-        new ApiResponse(200,createdUser,"User registered successfully")
-    )
 })
 
 
@@ -129,7 +153,7 @@ const loginUser = asyncHandler( async (req,res) => {
     
 
     const {accessToken ,refreshToken} = await generateAccessAndRefreshToken(user._id)
-    const loggedInUser = await User.findById(user._id).select("-password -refreshToken")
+    const loggedInUser = await User.findById(user._id).select("-password")
     
 
     const options = {
@@ -179,16 +203,17 @@ const logoutUser = asyncHandler (async (req,res) => {
 
 
 const refreshAccessToken = asyncHandler (async (req,res) => {
-
-    const incomingRefreshToken = req.cookies.refreshToken || req.body.refreshToken
+    
+    const incomingRefreshToken = req.cookies?.refreshToken || req.body?.refreshToken
     if(!incomingRefreshToken){
         throw new ApiError(401, "Unauthorized request")
     }
 
 
     try {
-        const decodedToken = jwt.verify(incomingRefreshToken, process.env.ACCESS_TOKEN_SECRET)
-        const user = await user.findById(decodedToken?._id)
+        const decodedToken = jwt.verify(incomingRefreshToken, process.env.REFRESH_TOKEN_SECRET)
+
+        const user = await User.findById(decodedToken?._id)
     
         if(!user){
             throw new ApiError(401, "Invalid refresh Token")
@@ -203,15 +228,15 @@ const refreshAccessToken = asyncHandler (async (req,res) => {
             secure: true
         }
     
-        const {accessToken,newRefreshToken} = await generateAccessAndRefreshToken(user._id)
-    
-        return res.send(200)
+        const {accessToken,refreshToken} = await generateAccessAndRefreshToken(user._id)
+        
+        return res.status(200)
         .cookie("accessToken", accessToken, [options])
-        .cookie("refreshToken", newRefreshToken, [options])
+        .cookie("refreshToken", refreshToken, [options])
         .json(
             new ApiResponse(
                 200,
-                {accessToken, refreshToken: newRefreshToken},
+                {accessToken, refreshToken},
                 "Access Token refreshed"
             )
         )
@@ -222,6 +247,7 @@ const refreshAccessToken = asyncHandler (async (req,res) => {
 
 
 const changeCurrentPassword = asyncHandler( async(req,res) => {
+    
     const{oldPassword, newPassword} = req.body
     
     const user = await User.findById(req.user._id)
@@ -247,7 +273,7 @@ const getCurrentUser = asyncHandler( async(req,res) => {
 const updateAccountDetails = asyncHandler( async(req,res) => {
     const {fullname, email} = req.body
 
-    if(!fullname || !email){
+    if(!fullname && !email){
         throw new ApiError(400,"All fileds are required")
     }
 
@@ -279,6 +305,11 @@ const updateUserAvatar = asyncHandler( async(req,res) => {
     if(!avatar.url){
         throw new ApiError(500,"Error while uploading on avatar")
     }
+    
+    const avatarPublicId = await extractPublicId(`${req.user?.avatar}`)
+    if(avatarPublicId){
+        await cloudinary.uploader.destroy(avatarPublicId).then(result => console.log(result));
+    }
 
     const user = await User.findByIdAndUpdate(
         req.user?._id,
@@ -305,6 +336,11 @@ const updateUserCoverImage = asyncHandler( async(req,res) => {
         throw new ApiError(500,"Error while uploading on cloudinary")
     }
 
+    const coverImagePublicId = await extractPublicId(`${req.user?.coverImage}`)
+    if(coverImagePublicId){
+        await cloudinary.uploader.destroy(coverImagePublicId).then(result => console.log(result));
+    }
+
     const user = await User.findByIdAndUpdate(
         req.user?._id,
         {
@@ -321,7 +357,7 @@ const updateUserCoverImage = asyncHandler( async(req,res) => {
 const getUserChannelProfile = asyncHandler( async(req,res) => {
 
     const {username} = req.params
-    if(!username?.trime()){
+    if(!username?.trim()){
         throw new ApiError(400, "Username is missing")
     }
 
